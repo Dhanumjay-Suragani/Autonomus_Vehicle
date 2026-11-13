@@ -1,3 +1,5 @@
+//----------------------------07-11-26----------------------------//
+
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
@@ -64,10 +66,10 @@ UART_HandleTypeDef huart2;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_SPI2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
-static void MX_SPI2_Init(void);
 /* USER CODE BEGIN PFP */
 static void USART1_ProcessRx(void);
 static void USART1_SendLine(const char *line);
@@ -111,9 +113,9 @@ typedef struct { const char *junction; const char *direction; } RouteStep;
 static const RouteStep routeTable[POINT_COUNT][POINT_COUNT][MAX_ROUTE_STEPS] = {
 /* FROM START */
 [0][1] = { STEP("J1","LEFT") },
-[0][2] = { STEP("J1","STRAIGHT"), STEP("J6","LEFT"), STEP("J2","RIGHT") },
-[0][3] = { STEP("J1","STRAIGHT"), STEP("J6","LEFT"), STEP("J2","STRAIGHT"), STEP("J5","LEFT"), STEP("J3","RIGHT") },
-[0][4] = { STEP("J1","STRAIGHT"), STEP("J6","LEFT"), STEP("J2","STRAIGHT"), STEP("J5","LEFT"), STEP("J3","STRAIGHT"), STEP("J4","LEFT") },
+[0][2] = { STEP("J1","STRAIGHT"), STEP("J6","LEFT"), STEP("J2","LEFT") },
+[0][3] = { STEP("J1","STRAIGHT"), STEP("J6","LEFT"), STEP("J2","STRAIGHT"), STEP("J5","RIGHT"), STEP("J3","RIGHT") },
+[0][4] = { STEP("J1","STRAIGHT"), STEP("J6","LEFT"), STEP("J2","STRAIGHT"), STEP("J5","RIGHT"), STEP("J3","STRAIGHT"), STEP("J4","LEFT") },
 [0][5] = { STEP("J1","STRAIGHT"), STEP("J6","LEFT"), STEP("J2","STRAIGHT"), STEP("J5","STRAIGHT") },
 [0][6] = { STEP("J1","STRAIGHT"), STEP("J6","STRAIGHT") },
 /* FROM D1 */
@@ -175,7 +177,7 @@ static uint8_t routeIndex = 0U;
 static uint8_t routeActive = 0U;
 static uint8_t turnInProgress = 0U;
 static uint8_t uTurnPending = 0U;
-/* Once destination is reached, ignore RFID until RESET or a new destination is accepted. */
+/* Arrival latch filters repeated events; RC522 polling never stops. */
 static uint8_t destinationReachedLock = 0U;
 static uint8_t rfidReady = 0U;
 static uint8_t lastSeenUID[4] = {0U};
@@ -239,9 +241,14 @@ static void USART1_HandleCommand(char *line)
     char destination[8] = {0};
     if (strcmp(line, "STOP") == 0) { ResetRouteState(); LineFollower_LatchStop(); USART1_SendLine("ACK|STOP"); return; }
     if (strcmp(line, "RESET") == 0) {
-        ResetRouteState(); destinationReachedLock = 0U; haveLastUID = 0U; uTurnPending = 0U;
+        ResetRouteState();
+        destinationReachedLock = 0U;
+        haveLastUID = 0U;
+        haveProcessedUID = 0U;
+        uTurnPending = 0U;
         LineFollower_ResetNavigationFault();
-        USART1_SendLine("ACK|RESET"); printf("[RFID] Destination lock cleared by RESET.\r\n"); return;
+        USART1_SendLine("ACK|RESET");
+        printf("[RFID] Destination lock cleared by RESET.\r\n"); return;
     }
     const char *d = NULL;
     if (strcmp(line, "START") == 0 || (sscanf(line, "DEST|%7s", destination) == 1 && strcmp(destination, "START") == 0)) d = "START";
@@ -260,7 +267,7 @@ static void USART1_HandleCommand(char *line)
             USART1_SendLine(message); printf("[DESTINATION] Already at %s; request rejected.\r\n", PointName(target)); return;
         }
         if (LineFollower_SetDestination()) {
-            destinationReachedLock = 0U; haveLastUID = 0U;
+            destinationReachedLock = 0U; haveLastUID = 0U; haveProcessedUID = 0U;
             routeOrigin = currentLocation; selectedDestination = target; routeIndex = 0U; routeActive = 1U; turnInProgress = 0U;
             uTurnPending = (routeOrigin != 0) ? 1U : 0U;
             char response[40]; snprintf(response, sizeof(response), "ACK|ROUTE|%s|%s", PointName(routeOrigin), PointName(target));
@@ -315,13 +322,44 @@ static void HandleRFIDTag(const uint8_t uid[4])
     const char *name = tagTable[found].name;
     printf("[RFID] Recognized %s\r\n", name);
     int8_t point = PointIndexFromName(name);
+    /*
+     * Keep polling the RC522 continuously, including after arrival. The
+     * destination lock filters events; it never disables the RFID reader.
+     */
     if (!routeActive || selectedDestination < 0) {
-        if (point >= 0) { currentLocation = point; printf("[LOCATION] Vehicle location confirmed: %s.\r\n", PointName(currentLocation));
-            char msg[40]; snprintf(msg, sizeof(msg), "LOCATION|%s", PointName(currentLocation)); USART1_SendLine(msg); }
-        else printf("[RFID] No active route; junction tag logged only.\r\n");
+        if (destinationReachedLock) {
+            /* Keep last confirmed arrival as currentLocation. A new destination
+               command may depart from it, including START (point index 0). */
+            return;
+        }
+
+        if (point >= 0) {
+            currentLocation = point;
+            printf("[LOCATION] Vehicle location confirmed: %s.\r\n", PointName(currentLocation));
+            char msg[40];
+            snprintf(msg, sizeof(msg), "LOCATION|%s", PointName(currentLocation));
+            USART1_SendLine(msg);
+        } else {
+            printf("[RFID] No active route; junction tag logged only.\r\n");
+        }
         return;
     }
-    if (turnInProgress || uTurnPending) { printf("[RFID] Ignored while maneuver is in progress.\r\n"); return; }
+
+    if (turnInProgress || uTurnPending) {
+        printf("[RFID] Ignored while maneuver is in progress.\r\n");
+        return;
+    }
+
+    /*
+     * The source location tag is physically underneath the vehicle when the
+     * route is selected. Ignore it throughout this route so it cannot be
+     * mistaken for an unexpected/early destination.
+     */
+    if (point >= 0 && point == routeOrigin) {
+        printf("[RFID] Ignored source-location tag %s while travelling to %s.\r\n",
+               name, PointName(selectedDestination));
+        return;
+    }
     if (name[0] == 'J') {
         if (routeIndex >= routeLengths[(uint8_t)routeOrigin][(uint8_t)selectedDestination] ||
             routeTable[(uint8_t)routeOrigin][(uint8_t)selectedDestination][routeIndex].junction == NULL ||
@@ -338,9 +376,15 @@ static void HandleRFIDTag(const uint8_t uid[4])
     }
     if (point >= 0) {
         if (point != selectedDestination || routeIndex != routeLengths[(uint8_t)routeOrigin][(uint8_t)selectedDestination]) {
-            printf("[NAV FAULT] Wrong/early point %s.\r\n", name); ResetRouteState(); LineFollower_LatchStop(); USART1_SendLine("ERR|RFID|WRONG_OR_EARLY_DEST"); return;
+            printf("[NAV FAULT] Wrong/early point %s.\r\n", name);
+            ResetRouteState();
+            LineFollower_LatchStop();
+            USART1_SendLine("ERR|RFID|WRONG_OR_EARLY_DEST"); return;
         }
-        LineFollower_Arrive(); currentLocation = point; destinationReachedLock = 1U; ResetRouteState(); haveLastUID = 0U; uTurnPending = 0U;
+        LineFollower_Arrive();
+        currentLocation = point;
+        destinationReachedLock = 1U;
+        ResetRouteState(); haveLastUID = 0U; uTurnPending = 0U;
         printf("[LOCATION] ARRIVED at %s.\r\n", PointName(currentLocation));
         printf("[RFID] Destination lock active until RESET or a new destination command.\r\n");
         char response[40]; snprintf(response, sizeof(response), "ARRIVE|%s", PointName(point)); USART1_SendLine(response);
@@ -351,11 +395,38 @@ static void RFID_Process(void)
 {
     uint8_t uid[4];
     uint32_t now = HAL_GetTick();
+    static uint32_t lastDiagMs = 0U;
 
-    /* Destination complete: do not poll or process any RFID tag until an
-       explicit RESET or a successfully accepted new destination command. */
-    if (destinationReachedLock) return;
-    if (!rfidReady) return;
+    /* Report reader-stage counters every 2 seconds for firmware debugging. */
+    if ((uint32_t)(now - lastDiagMs) >= 2000U) {
+        RC522_Diag_t d;
+        RC522_GetDiag(&d);
+//        printf("[RFID DIAG] polls=%lu uidOK=%lu REQA_OK=%lu REQA_timeout=%lu "
+//               "REQA_error=%lu anticollision_fail=%lu BCC_fail=%lu SPI_fail=%lu lastErr=0x%02X\r\n",
+//               (unsigned long)d.polls,
+//               (unsigned long)d.ok,
+//               (unsigned long)d.reqaOk,
+//               (unsigned long)d.reqaTimeout,
+//               (unsigned long)d.reqaError,
+//               (unsigned long)d.antiFail,
+//               (unsigned long)d.bccFail,
+//               (unsigned long)d.spiFail,
+//               d.lastErr);
+        lastDiagMs = now;
+    }
+
+    /* Retry reader startup if a transient SPI/version read failed. */
+    if (!rfidReady) {
+        static uint32_t lastRetryMs = 0U;
+        if ((uint32_t)(now - lastRetryMs) >= 2000U) {
+            lastRetryMs = now;
+            RC522_Init();
+            uint8_t v = RC522_ReadVersion();
+            rfidReady = (v != 0x00U && v != 0xFFU);
+            printf("[RFID] Reader retry: version=0x%02X ready=%u\r\n", v, rfidReady);
+        }
+        if (!rfidReady) return;
+    }
 
     if (!RC522_ReadUID(uid)) {
         /* Do not re-arm on a single missed read: RC522 reads can briefly drop
@@ -425,25 +496,71 @@ static void USART1_StartRx(void)
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == USART1) {
-        uint16_t next = (uint16_t)((usart1RxHead + 1U) % USART1_RX_QUEUE_SIZE);
-        if (next != usart1RxTail) {
+    if (huart->Instance == USART1)
+    {
+        uint16_t next =
+            (uint16_t)((usart1RxHead + 1U) % USART1_RX_QUEUE_SIZE);
+
+        if (next != usart1RxTail)
+        {
             usart1RxQueue[usart1RxHead] = usart1RxByte;
             usart1RxHead = next;
-        } else {
+        }
+        else
+        {
             usart1RxOverflow = 1U;
         }
-        (void)HAL_UART_Receive_IT(&huart1, &usart1RxByte, 1U);
+
+        HAL_StatusTypeDef status =
+            HAL_UART_Receive_IT(&huart1, &usart1RxByte, 1U);
+
+        if (status != HAL_OK)
+        {
+            /* Record the failure for reporting from the main loop. */
+            usart1RxOverflow = 1U;
+        }
     }
 }
+//void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+//{
+//    if (huart->Instance == USART1) {
+//        uint16_t next = (uint16_t)((usart1RxHead + 1U) % USART1_RX_QUEUE_SIZE);
+//        if (next != usart1RxTail) {
+//            usart1RxQueue[usart1RxHead] = usart1RxByte;
+//            usart1RxHead = next;
+//        } else {
+//            usart1RxOverflow = 1U;
+//        }
+//        (void)HAL_UART_Receive_IT(&huart1, &usart1RxByte, 1U);
+//    }
+//}
+
+static volatile uint32_t usart1LastError = HAL_UART_ERROR_NONE;
+static volatile uint8_t usart1ErrorEvent = 0U;
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == USART1) {
+    if (huart->Instance == USART1)
+    {
+        usart1LastError = HAL_UART_GetError(huart);
+        usart1ErrorEvent = 1U;
+
         (void)HAL_UART_AbortReceive(&huart1);
-        (void)HAL_UART_Receive_IT(&huart1, &usart1RxByte, 1U);
+        (void)HAL_UART_Receive_IT(
+            &huart1,
+            &usart1RxByte,
+            1U
+        );
     }
 }
+
+//void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+//{
+//    if (huart->Instance == USART1) {
+//        (void)HAL_UART_AbortReceive(&huart1);
+//        (void)HAL_UART_Receive_IT(&huart1, &usart1RxByte, 1U);
+//    }
+//}
 
 /* USER CODE END 0 */
 
@@ -476,14 +593,14 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_TIM3_Init();
   MX_SPI2_Init();
+  MX_TIM3_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
-  USART1_StartRx();
-  HAL_Delay(20U);
-  USART1_SendLine("STM32 READY");
   /* USER CODE BEGIN 2 */
+  /* Start USART1 reception from the ESP32. */
+
+    USART1_StartRx();
 
   /* Start both motor PWM channels (TIM3 ARR = 99). */
     if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1) != HAL_OK)
@@ -500,7 +617,7 @@ int main(void)
   uint8_t rc522Version = RC522_ReadVersion();
   printf("[RFID] RC522 version: 0x%02X\r\n", rc522Version);
   rfidReady = (rc522Version != 0x00U && rc522Version != 0xFFU);
-  if (!rfidReady) { printf("[RFID ERROR] RC522 not responding; navigation remains locked.\r\n"); LineFollower_LatchStop(); }
+  if (!rfidReady) { printf("[RFID ERROR] RC522 not responding at startup; automatic retry enabled.\r\n"); }
   else printf("[RFID] Reader ready; STM32 owns RFID and route logic.\r\n");
 
   printf("\r\n");
@@ -523,10 +640,24 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    USART1_ProcessRx();
-    RFID_Process();
-    LineFollower_Run();
-    USART1_ReportEvents();
+    /* USER CODE END WHILE */
+	  RFID_Process();
+
+	  if (usart1ErrorEvent != 0U)
+	  {
+	      uint32_t error = usart1LastError;
+	      usart1ErrorEvent = 0U;
+
+	      printf(
+	          "[USART1 ERROR] HAL error code = 0x%08lX\r\n",
+	          (unsigned long)error
+	      );
+	  }
+	  USART1_ProcessRx();
+
+	      LineFollower_Run();
+	      USART1_ReportEvents();
+
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -821,7 +952,8 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, M_IN3_Pin|M_IN4_Pin|US_TRIG_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, M_IN1_Pin|M_IN2_Pin|RFID_CS_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, M_IN1_Pin|M_IN2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(RFID_CS_GPIO_Port, RFID_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(RFID_RST_GPIO_Port, RFID_RST_Pin, GPIO_PIN_RESET);

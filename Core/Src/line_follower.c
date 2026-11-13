@@ -34,19 +34,40 @@
 
 extern TIM_HandleTypeDef htim3;
 
-#define BASE_SPEED                 70U
-#define TURN_SPEED                 85U
-#define SHARP_SPEED                95U
+//#define BASE_SPEED                 70U
+//#define TURN_SPEED                 85U
+//#define SHARP_SPEED                95U
+//#define MAX_PWM                    99U
+//#define STOP_SPEED                 0U
+//#define OBSTACLE_DISTANCE_CM       20.0f
+//#define ULTRASONIC_PERIOD_MS       100U
+//#define CLEAR_READINGS_REQUIRED    3U
+
+/* ================= FEATURE CONFIGURATION ================= */
+
+/* 0 = Disable ultrasonic obstacle protection temporarily.
+ * 1 = Enable ultrasonic obstacle protection again.
+ */
+#define ENABLE_ULTRASONIC_OBSTACLE_PROTECTION    0U
+
+/* ================= MOTOR CONFIGURATION =================== */
+
+#define BASE_SPEED                 50U
+#define TURN_SPEED                 75U
+#define SHARP_SPEED                80U
 #define MAX_PWM                    99U
 #define STOP_SPEED                 0U
-#define OBSTACLE_DISTANCE_CM       20.0f
+
+/* Retained for future ultrasonic reactivation. */
+#define OBSTACLE_DISTANCE_CM       30.0f
 #define ULTRASONIC_PERIOD_MS       100U
 #define CLEAR_READINGS_REQUIRED    3U
-#define TURN_MIN_MS                1500U  /* Commit to the requested turn for at least 1.5 s. */
-#define TURN_TIMEOUT_MS            4000U  /* Allow time to complete the committed turn and reacquire line. */
+
+#define TURN_MIN_MS                750U  /* Commit to the requested turn for at least 1.5 s. */
+#define TURN_TIMEOUT_MS            1000U  /* Allow time to complete the committed turn and reacquire line. */
 #define LINE_CONFIRM_READINGS      3U
-#define UTURN_MIN_MS               1800U  /* Initial calibration value; tune on the actual vehicle. */
-#define UTURN_TIMEOUT_MS           5000U
+#define UTURN_MIN_MS               1700U  /* Initial calibration value; tune on the actual vehicle. */
+#define UTURN_TIMEOUT_MS           2000U
 
 typedef enum { LAST_NONE = 0, LAST_LEFT, LAST_RIGHT } LastDirection_t;
 typedef enum { TURN_NONE = 0, TURN_STRAIGHT, TURN_LEFT, TURN_RIGHT, TURN_AROUND } TurnMode_t;
